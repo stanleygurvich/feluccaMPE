@@ -1,6 +1,6 @@
 # Felucca MPE
 
-**MPE (MIDI Polyphonic Expression) for the M-Vave FM-1, plus VLFO and DRIFT: chords that move and breathe, on any
+**MPE (MIDI Polyphonic Expression) for the M-Vave FM-1, plus Voice LFO (VLFO) and DRIFT: chords that move and breathe, on any
 keyboard.** By Stanley Gurvich, Emerald Moon Labs.
 Built on [Felucca](https://github.com/hugelton/Felucca) 1.6.1 by Leo Kuroshita, Hügelton Instruments (GPL-3.0-only).
 
@@ -20,12 +20,12 @@ Built on [Felucca](https://github.com/hugelton/Felucca) 1.6.1 by Leo Kuroshita, 
 Played in the emulator with a **ROLI Seaboard RISE 49** and an **Embodme Erae Touch (Mk 1)**: it works, and it feels
 like any other MPE synth.
 
-## VLFO and DRIFT: every voice its own movement, no MPE controller needed
+## Voice LFO (VLFO) and DRIFT: every voice its own movement, no MPE controller needed
 
 Two new modulation sources give each note of a chord a life of its own. They work on any MIDI IN setting, on the
 FM-1's own keys and on its sequencer, and cost nothing while no slot uses them.
 
-- **VLFO (voice LFO):** the track's LFO, read at a different point of its cycle for each voice (the eight voice slots
+- **Voice LFO (VLFO):** the track's LFO, read at a different point of its cycle for each voice (the eight voice slots
   sit 45° apart). With the plain LFO a chord's notes all move together; with VLFO they move out of step. **VLFO →
   PITCH**, AMT 1–2 and a slow RATE: an ensemble, a gentle chorus made of the notes themselves. **VLFO → CUT**: a
   chord that shimmers note by note. It follows the LFO's RATE, SYNC, WAVE, FADE and the matrix's DEPTH. It is
@@ -48,7 +48,7 @@ with every finger its own voice and its own expression:
 - **Press and Slide shape each note.** Two modulation sources, **PRES** (how hard you press) and **TIMB** (sliding
   along the key), go to any per-note destination: press harder for louder (AMP), slide to open the filter (CUT),
   press for vibrato (PITCH), or reshape the tone (SHP). Each finger moves only its own note.
-- **Chords that breathe, on any keyboard:** VLFO and DRIFT (above).
+- **Chords that breathe, on any keyboard:** Voice LFO (VLFO) and DRIFT (above).
 - **A bigger bend range everywhere:** up to ±96 semitones on every MIDI IN setting (Felucca: ±24).
 - **Everything else is Felucca 1.6.1, unchanged.** The same sounds, sequencer, effects and projects.
 
@@ -99,7 +99,7 @@ the others (PAN, the sends, the engine knobs, RATE) they take the latest note's.
 | --- | --- | --- |
 | **PRES** | the finger's pressure (MPE channel pressure); outside MPE, the track's aftertouch | PRES → AMP: swells. PRES → PITCH, small AMT: vibrato by pressing |
 | **TIMB** | the finger's slide along the key (MPE CC74); 0 outside MPE | TIMB → CUT: a filter per finger |
-| **VLFO** | the track's LFO at a different phase for each voice | VLFO → PITCH, AMT 1–2, slow RATE: ensemble. VLFO → CUT: a shimmering chord |
+| **VLFO** (Voice LFO) | the track's LFO at a different phase for each voice | VLFO → PITCH, AMT 1–2, slow RATE: ensemble. VLFO → CUT: a shimmering chord |
 | **DRIFT** | a slow random wander per voice (a new target every ~3 s) | DRIFT → PITCH, AMT 1 (±15 cents) or 2 (±30): analog drift |
 
 VLFO and DRIFT work on any MIDI IN setting and on the sequencer's notes, not only in MPE.

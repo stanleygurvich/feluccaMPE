@@ -40,7 +40,7 @@ finger modulates only its own note. Route them like any source:
   The master channel's (channel 1) still are the track's.
 - Outside MPE, PRES is the track's channel aftertouch (as AT) and TIMB is 0.
 
-### VLFO (works on any MIDI IN)
+### VLFO: Voice LFO (works on any MIDI IN)
 
 A matrix source after TIMB: the track's LFO read at each voice slot's own phase (slot k at k × 45°), so the notes of
 a chord move out of step instead of together. VLFO → PITCH (note) with AMT 1..2 and a slow RATE: drift / ensemble;
