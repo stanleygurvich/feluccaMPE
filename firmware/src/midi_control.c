@@ -19,11 +19,16 @@ static uint8_t midi_sel_on[16][128];
 static uint16_t midi_owners[NTRK];           /* avoids rescanning all 2048 entries for CC123 */
 #define MIDI_PEDAL_NOTE 0x80u
 
+/* MIDI IN MPE (this fork): a lower zone, channel 1 (0) the master (the track's bend, wheel, pedal as SEL plays
+ * them), 2..16 the members: a note each, its bend its own (voice.c mpe_*), +-48 semitones until an RPN 0 says
+ * otherwise (the MPE default; the master's stays 2) */
+static int mpe_member(uint32_t ch) { return song.g[G_ROUTE] == ROUT_MPE && ch; }
+
 static midi_channel_t *midi_channel(uint32_t ch)
 {
     midi_channel_t *c = &midi_ch[ch];
     if (!c->ready) {
-        c->semis = 2;
+        c->semis = mpe_member(ch) ? 48 : 2;
         c->rpn_msb = c->rpn_lsb = 127;
         c->ready = 1;
     }
@@ -35,17 +40,28 @@ static uint32_t midi_targets(uint32_t ch)
     return midi_channel(ch)->targets | (1u << trk_index(midi_track(ch)));
 }
 
-static void midi_expression(track_t *t, const midi_channel_t *c)
+/* channel c's bend in Q8 semitones, by its range (RPN 0) */
+static int32_t midi_bend_q8v(const midi_channel_t *c)
 {
     int32_t range = ((int32_t)c->semis * 100 + c->cents) * 256 / 100;
+    return (int32_t)c->bend * range / (c->bend < 0 ? 8192 : 8191);
+}
+
+static void midi_expression(track_t *t, const midi_channel_t *c)
+{
     if (drum_track(t))
         return;
-    midi_bend_target[trk_index(t)] = (int32_t)c->bend * range / (c->bend < 0 ? 8192 : 8191);
+    midi_bend_target[trk_index(t)] = midi_bend_q8v(c);
 }
 
 static void midi_expression_channel(uint32_t ch)
 {
-    uint32_t i, mask = midi_targets(ch);
+    uint32_t i, mask;
+    if (mpe_member(ch)) {                          /* MPE: the bend of this channel's note only */
+        mpe_ch_bend[ch] = midi_bend_q8v(midi_channel(ch));
+        return;
+    }
+    mask = midi_targets(ch);
     for (i = 0; i < NPART; i++)
         if (mask & (1u << i))
             midi_expression(&trk[i], midi_channel(ch));
@@ -93,9 +109,15 @@ static void midi_release(uint32_t ch, uint32_t note)
                 nn[i] = m->note[i];
             m->id = 0;
         }
+        mpe_off_ch = mpe_member(ch) ? (uint8_t)(ch + 1u) : 0u;   /* MPE: this channel's voices only */
         for (i = 0; i < n; i++)
             if (!midi_local_held(&trk[id - 1u], nn[i]))
                 input_off(&trk[id - 1u], nn[i]);  /* input_off also checks other MIDI owners */
+        mpe_off_ch = 0;
+        if (mpe_member(ch))                        /* MPE: its voices keep their bend, the channel is free */
+            for (i = 0; i < NVOICE; i++)
+                if (mpe_vch[id - 1u][i] == ch + 1u)
+                    mpe_vch[id - 1u][i] = 0;
     }
 }
 
@@ -112,9 +134,11 @@ static void midi_play(track_t *t, uint32_t ch, uint32_t note, uint32_t vel)
         n = 1;
         nn[0] = (uint8_t)note;
     }
+    mpe_in_ch = mpe_member(ch) && !drum_track(t) ? (uint8_t)(ch + 1u) : 0u;   /* voice.c mpe_bind */
     for (i = 0; i < n; i++)
-        if (!midi_note_held(t, nn[i]) && !midi_local_held(t, nn[i]))
+        if ((mpe_in_ch || !midi_note_held(t, nn[i])) && !midi_local_held(t, nn[i]))   /* (MPE: a finger each) */
             input_on(t, nn[i], vel);
+    mpe_in_ch = 0;
     if (n > 1u || nn[0] != note) {
         mchord_t *m = &mchord[f];
         m->ch = (uint8_t)ch;
@@ -135,7 +159,8 @@ static void midi_note_event(uint32_t ch, uint32_t note, uint32_t vel)
         /* Repeated notes replace the previous press, including a pedal-held one. */
         if (id)
             midi_release(ch, note);
-        midi_expression(t, c);
+        if (!mpe_member(ch))                       /* (MPE: a member's bend is its note's, not the track's) */
+            midi_expression(t, c);
         if (t != TSEL)
             midi_hint = (uint8_t)(trk_index(t) + 1u);
         midi_seen |= (uint8_t)(1u << trk_index(t));   /* (1.5.5: only noted; the UI does the rest) */
@@ -347,9 +372,9 @@ static void midi_control(uint32_t ch, uint32_t cc, uint32_t value)
         c->rpn_msb = c->rpn_lsb = 127;
         break;
     case 6: case 38:
-        if (!c->rpn_msb && !c->rpn_lsb) {           /* RPN 0: +/-0..24 semitones, 0..99 cents */
-            if (cc == 6u)
-                c->semis = (uint8_t)(value > 24u ? 24u : value);
+        if (!c->rpn_msb && !c->rpn_lsb) {           /* RPN 0: +/-0..96 semitones (MPE fork; upstream 24), 0..99 cents */
+            if (cc == 6u)                          /* (96: MPE's largest; a Seaboard asks 48, on any routing) */
+                c->semis = (uint8_t)(value > 96u ? 96u : value);
             else
                 c->cents = (uint8_t)(value > 99u ? 99u : value);
             midi_expression_channel(ch);
@@ -358,6 +383,30 @@ static void midi_control(uint32_t ch, uint32_t cc, uint32_t value)
     default:
         midi_cc_map(midi_track(ch), cc, value);
         break;
+    }
+}
+
+/* MIDI IN switched to MPE (on) or away from it: the member channels' bend range (MPE's 48, or the 2 of every other
+ * routing) and their bends; no voice follows a channel any more */
+static __attribute__((noinline)) void mpe_route(int on)
+{
+    uint32_t ch;
+    for (ch = 1; ch < 16u; ch++) {
+        midi_channel_t *c = midi_channel(ch);
+        c->semis = on ? 48u : 2u;
+        c->cents = 0;
+        mpe_ch_bend[ch] = 0;
+        mpe_ch_pres[ch] = mpe_ch_timb[ch] = 0;
+        if (on)
+            mpe_ch_bend[ch] = midi_bend_q8v(c);
+    }
+    memset(mpe_vch, 0, sizeof mpe_vch);
+    if (!on)                                       /* (outside MPE the voices' own bends are not rendered: none kept) */
+        memset(mpe_vbend, 0, sizeof mpe_vbend);
+    if (on) {                                      /* the tracks' bends: only the master's, on the selected track */
+        for (ch = 0; ch < NTRK; ch++)
+            midi_bend_target[ch] = 0;
+        midi_expression(TSEL, midi_channel(0));
     }
 }
 
@@ -394,7 +443,7 @@ static volatile uint8_t *const mpc_io;
  * channel aftertouch, Program Change, so they stay free for other instruments. */
 static void __attribute__((noinline)) midi_event(uint32_t st, uint32_t ch, uint32_t d1, uint32_t d2)
 {
-    if (song.g[G_ROUTE] != 1 && !midi_in_block(ch))
+    if (midi_base() != -1 && !midi_in_block(ch))      /* (SEL and MPE: every channel; TRACK: midi_in_block) */
         return;
     if (st == 0x90u || st == 0x80u)
         midi_note_event(ch, d1, st == 0x90u ? d2 : 0);
@@ -402,10 +451,18 @@ static void __attribute__((noinline)) midi_event(uint32_t st, uint32_t ch, uint3
         midi_channel(ch)->bend = (int16_t)((int32_t)(d1 | (d2 << 7)) - 8192);
         midi_expression_channel(ch);
     } else if (st == 0xB0u) {
+        if (mpe_member(ch) && d1 == 74u) {         /* MPE Slide: its note's TIMB (not the track's CC74 map) */
+            mpe_ch_timb[ch] = (uint8_t)d2;
+            return;
+        }
         mod_midi(midi_track(ch), st, d1, d2);
         midi_control(ch, d1, d2);
-    } else if (st == 0xD0u)
-        mod_midi(midi_track(ch), st, d1, d2);
+    } else if (st == 0xD0u) {
+        if (mpe_member(ch))                        /* MPE Press: its note's PRES (not the track's AT) */
+            mpe_ch_pres[ch] = (uint8_t)d1;
+        else
+            mod_midi(midi_track(ch), st, d1, d2);
+    }
     else if (st == 0xC0u && mpc_io)                /* Program Change: the main loop loads it (ui.c midi_pc_poll) */
         mpc_io[trk_index(midi_track(ch))] = (uint8_t)(0x80u | d1);
 }

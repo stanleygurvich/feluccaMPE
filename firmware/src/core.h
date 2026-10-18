@@ -78,7 +78,9 @@ enum {                          /* global parameters */
     G_DTIME, G_DFDBK, G_DCOLOR, G_DMIX,
     G_RSIZE, G_RDAMP, G_CRATE, G_CDEPTH,
     G_MIDI, G_SYNC, G_ROUTE, G_INFO,   /* G_ROUTE: MIDI IN, 0 CH1-4 (channels 1..4 -> parts 1..4, 5..16 ignored), 1 SEL;
-                                        * 1.2: 2..4 CH5-8 CH9-12 CH13-16 (seq.c midi_base); 1.5.5: 5 TRACK (song.mch) */
+                                        * 1.2: 2..4 CH5-8 CH9-12 CH13-16 (seq.c midi_base); 1.5.5: 5 TRACK (song.mch);
+                                        * MPE fork: 6 MPE (a lower zone: channel 1 the master, 2..16 a note each,
+                                        * the selected track; midi_control.c, voice.c) */
     G_SLOT, G_NAME, G_LOAD, G_SAVE,
     G_ENGSEL, G_ENGGO,          /* no page: the editor switches the engine with a SET of G_ENGSEL; G_ENGGO is
                                  * unused (ids are fixed by the formats and the protocol) */
@@ -358,6 +360,27 @@ typedef struct {
 
 static track_t trk[NTRK];        /* the instrument: four parts */
 static song_t song;
+#define ROUT_MPE 6               /* G_ROUTE: MIDI IN MPE (this fork; after upstream 1.5.5's TRACK, 5) */
+/* MPE (MIDI IN MPE, this fork): a member channel's note bends alone. Each voice keeps the channel (+ 1, 0 none) of
+ * the note it plays and its own bend, Q8 semitones, smoothed towards that channel's (mpe_ch_bend, set by
+ * midi_control.c), added to the track's (the master channel's). A note let go keeps the bend it had (the channel is
+ * dropped: the next note on it must not move this one's release). Live performance state, as the track's bend. */
+static uint8_t mpe_in_ch;                    /* the member channel (+ 1) of the MIDI note starting now, 0 none */
+static uint8_t mpe_off_ch;                   /* .. of the MIDI note let go now: only its voices end (two fingers can
+                                              * hold the same note, each on its channel) */
+static uint8_t mpe_vch[NTRK][NVOICE];
+static int32_t mpe_vbend[NTRK][NVOICE], mpe_ch_bend[16];
+/* .. and its Press (channel pressure) and Slide (CC74, timbre), the matrix's PRES and TIMB (mod.c): each member
+ * channel's latest 0..127, each voice's own smoothed Q15, from its channel while it owns one (a note let go keeps
+ * what it had); with another MIDI IN, PRES is the track's channel aftertouch (AT) and TIMB 0 */
+static uint8_t mpe_ch_pres[16], mpe_ch_timb[16];
+static int32_t mpe_vpres[NTRK][NVOICE], mpe_vtimb[NTRK][NVOICE];
+static uint32_t drift_t;      /* DRIFT (mod.c drift_val): audio blocks since power-on (fx.c mix_block) */
+static int32_t mpe_cur[C1_NP][4];   /* the voice track_render is on: its PRES, TIMB, VLFO, DRIFT for mod_voice (voice.c
+                                     * mpe_voice_pt); a part's own, C1_PI(t): two cores render parts at once */
+/* a Q8 semitone's residual below 1/16 (0..15) in the 1/4096 of the fine factor: k * 2367 / 2560 (voice.c), a table: no
+ * divide per voice in the audio ISR */
+static const int16_t MPE_FINE[16] = {0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 13};
 #define TSEL (&trk[song.sel])    /* the selected track */
 /* MIDI IN TRACK: track i's channel 0..15, MCH_OMNI or MCH_OFF (song.mch), and set */
 static inline uint32_t mch_get(uint32_t i)

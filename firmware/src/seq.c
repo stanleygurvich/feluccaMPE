@@ -63,7 +63,7 @@ static uint32_t trk_index(const track_t *t) { return (uint32_t)(t - trk); }
 static int32_t midi_base(void)
 {
     uint32_t r = (uint32_t)song.g[G_ROUTE];
-    return r == ROUTE_SEL ? -1 : r == ROUTE_TRACK ? -2 : r ? (int32_t)(r - 1u) * 4 : 0;
+    return r == ROUTE_SEL || r == ROUT_MPE ? -1 : r == ROUTE_TRACK ? -2 : r ? (int32_t)(r - 1u) * 4 : 0;   /* (MPE: every channel, as SEL) */
 }
 /* MIDI channel 0..15 of track i (keys -> MIDI out): its channel in ROUT's block (SEL, CH1-4: 1..4); TRACK its own (OMNI,
  * OFF: as CH1-4) */
@@ -636,7 +636,7 @@ static int midi_note_held(const track_t *t, uint32_t note);
 static int midi_local_held(const track_t *t, uint32_t note);
 static void input_off(track_t *t, uint32_t note)
 {
-    if (midi_note_held(t, note))
+    if (midi_note_held(t, note) && !(mpe_off_ch && trk_vmode(t) == V_POLY))   /* (MPE: this finger's voice ends) */
         return;
     if (cin_left) {                                 /* a kept note let go before step 1: recorded, then let go */
         uint32_t i = trk_index(t), k;
@@ -1326,9 +1326,12 @@ static void events_block(uint32_t n)
         transport_req = 0;
     }
     if (midi_route != (uint8_t)song.g[G_ROUTE]) {     /* ROUT changed: a block lets go of the other channels */
+        uint32_t was_mpe = midi_route == ROUT_MPE;
         midi_route = (uint8_t)song.g[G_ROUTE];
-        if (midi_route != ROUTE_SEL)
+        if (midi_route != ROUTE_SEL && midi_route != ROUT_MPE)
             midi_route_block();
+        if (was_mpe != (midi_route == ROUT_MPE))       /* into or out of MPE (only): the members' bend range */
+            mpe_route(midi_route == ROUT_MPE);
     }
     pr = panic_req;
     panic_req = 0;
@@ -1336,6 +1339,7 @@ static void events_block(uint32_t n)
         mi_r = mi_w;
         memset(midi_sel_on, 0, sizeof midi_sel_on);
         memset(midi_ch, 0, sizeof midi_ch);
+        memset(mpe_ch_bend, 0, sizeof mpe_ch_bend);
         memset(midi_owners, 0, sizeof midi_owners);
         memset(mchord, 0, sizeof mchord);
         midi_hint = 0;

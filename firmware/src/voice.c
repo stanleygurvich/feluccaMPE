@@ -223,8 +223,8 @@ static voice_t *voice_alloc(track_t *t, uint32_t note)
             return voice_reuse(t, v);
     }
     for (i = 0; i < np; i++) {
-        if (t->v[i].active && t->v[i].note == note)
-            return voice_reuse(t, &t->v[i]);
+        if (t->v[i].active && t->v[i].note == note && (!mpe_in_ch || mpe_vch[t - trk][i] == mpe_in_ch))
+            return voice_reuse(t, &t->v[i]);              /* (MPE: another finger's note is another voice) */
         nfree += !t->v[i].active;
     }
     if (nfree && voices_busy() >= NVOICE) {
@@ -271,6 +271,15 @@ static voice_t *voice_alloc(track_t *t, uint32_t note)
     return voice_reuse(t, &t->v[best == np ? 0 : best]);
 }
 
+static void mpe_bind(const track_t *t, const voice_t *v)
+{
+    uint32_t ti = (uint32_t)(t - trk), vi = (uint32_t)(v - t->v);
+    mpe_vch[ti][vi] = mpe_in_ch;
+    mpe_vbend[ti][vi] = mpe_in_ch ? mpe_ch_bend[mpe_in_ch - 1u] : 0;   /* the bend sent before the note: at once */
+    mpe_vpres[ti][vi] = mpe_in_ch ? mpe_ch_pres[mpe_in_ch - 1u] * 258 : t->at * 258;   /* .. its press and slide too */
+    mpe_vtimb[ti][vi] = mpe_in_ch ? mpe_ch_timb[mpe_in_ch - 1u] * 258 : 0;
+}
+
 /* glide: RATE = a fixed speed, TIME = the same time for any interval */
 static void glide_set(track_t *t, voice_t *v, int glide)
 {
@@ -305,6 +314,7 @@ static void voice_start(track_t *t, voice_t *v, uint32_t note, uint32_t vel, int
     v->mvel = t->m_vel;                                 /* mod.c: the note's VEL and RAND */
     v->mrnd = t->m_rnd;
     t->m_vi = (uint8_t)(v - t->v);
+    mpe_bind(t, v);
     glide_set(t, v, glide);
     if (!sounding) {
         v->env = 0;
@@ -361,6 +371,8 @@ static void mono_play(track_t *t, uint32_t note, uint32_t vel, int retrig, int g
             v->mrnd = t->m_rnd;
             if (vel > v->vel && nv == 1u)
                 v->vel = (uint8_t)vel;
+            if (mpe_in_ch)                                  /* MPE: the new finger's bend from now on */
+                mpe_bind(t, v);
             glide_set(t, v, glide);
         }
     }
@@ -466,7 +478,9 @@ static void trk_note_off(track_t *t, uint32_t note)
         }
     }
     for (i = 0; i < NVOICE; i++)                        /* a fallback above already has its new pitch */
-        if (t->v[i].note == note && t->v[i].gate) {
+        if (t->v[i].note == note && t->v[i].gate &&
+            (!mpe_off_ch || mode != V_POLY || mpe_vch[t - trk][i] == mpe_off_ch || !mpe_vch[t - trk][i])) {
+            /* (MPE: this finger's voice, or one no finger owns: started before MIDI IN became MPE, or by the ARP) */
             t->v[i].gate = 0;
             t->v[i].stage = 3;
         }
@@ -656,6 +670,55 @@ static __attribute__((noinline)) void spread_sum(int32_t *out)
 }
 #endif
 
+/* MPE (this fork), out of track_render's voice loop (noinline: the audio ISR's loops keep their size; the work runs
+ * only for a voice that has an MPE bend, or a part whose matrix takes PRES / TIMB). Shifts and a table, no divides */
+/* a voice's own bend, smoothed onto its channel's, on top of the track's bend (Q8): the 1/16 semitones, *fine the rest */
+static int32_t mpe_voice_bend(uint32_t ti, uint32_t i, int32_t bend, int32_t *fine)
+{
+    int32_t *vb = &mpe_vbend[ti][i], b;
+    if (mpe_vch[ti][i]) {
+        int32_t d = mpe_ch_bend[mpe_vch[ti][i] - 1u] - *vb;
+        *vb += d >= 4 ? (d + 3) >> 2 : d <= -4 ? -((3 - d) >> 2) : d;   /* = the track's (d +- 3) / 4 */
+    }
+    b = bend + *vb;
+    *fine = MPE_FINE[b & 15];                           /* = (b - floor(b / 16) * 16) * 2367 / 2560 */
+    return b >> 4;                                      /* floor, = the track's -((-b + 15) / 16) */
+}
+/* a voice's Press and Slide (PRES / TIMB, Q15): from its channel, halfway a block (~3 ms), landing exactly; a note let
+ * go keeps them; outside MPE, PRES is the track's aftertouch and TIMB 0. Left in the part's mpe_cur for mod_voice */
+static void mpe_voice_pt(const track_t *t, uint32_t ti, uint32_t i)
+{
+    uint32_t c = mpe_vch[ti][i];
+    int32_t tp = c ? mpe_ch_pres[c - 1u] * 258 : song.g[G_ROUTE] == ROUT_MPE ? mpe_vpres[ti][i] : t->at * 258;
+    int32_t tt = c ? mpe_ch_timb[c - 1u] * 258 : song.g[G_ROUTE] == ROUT_MPE ? mpe_vtimb[ti][i] : 0;
+    int32_t dp = tp - mpe_vpres[ti][i], dt = tt - mpe_vtimb[ti][i];
+    mpe_vpres[ti][i] += dp > -4 && dp < 4 ? dp : dp >> 1;
+    mpe_vtimb[ti][i] += dt > -4 && dt < 4 ? dt : dt >> 1;
+    mpe_cur[C1_PI(t)][0] = mpe_vpres[ti][i];
+    mpe_cur[C1_PI(t)][1] = mpe_vtimb[ti][i];
+}
+
+/* the MPE work of voice i of part ti, from track_render's loop only while MIDI IN is MPE or the matrix takes PRES /
+ * TIMB (one test per voice there, nothing else): its bend (*b16, *fine: the 1/16 semitones and the rest, as given
+ * when it has none) and its Press / Slide */
+static __attribute__((noinline)) void mpe_voice(track_t *t, uint32_t ti, uint32_t i, int32_t bend, int32_t *b16,
+                                                int32_t *fine)
+{
+    const modw_t *mw = &MOD(t);
+    int32_t *cur = mpe_cur[C1_PI(t)];
+    if (mpe_vch[ti][i] | mpe_vbend[ti][i])
+        *b16 = mpe_voice_bend(ti, i, bend, fine);
+    if (mw->mpe & 1u)
+        mpe_voice_pt(t, ti, i);
+    _Static_assert(NVOICE == 8, "VLFO: i << 29 spreads the 8 voice slots round the LFO's cycle");
+    if (mw->mpe & 2u) {                                 /* VLFO: the LFO at this voice slot's own phase (i x 45 deg) */
+        int32_t x = mulq15(lfo_wave(t, t->lfo_ph + (i << 29)), t->lfo_fade);   /* (bipolar: POL UNI not here) */
+        cur[2] = mw->ldep < 32767 ? mulq15(x, mw->ldep) : x;   /* (the matrix's DEPTH, as on the LFO) */
+    }
+    if (mw->mpe & 4u)                                   /* DRIFT: this voice's own slow random wander */
+        cur[3] = drift_val(ti * NVOICE + i);
+}
+
 /* render one block of a part into out (cleared here); returns the voices rendered */
 /* Channel bend is live performance state, outside projects/presets. Q8 semitones. */
 static int32_t midi_bend_q8[NTRK], midi_bend_target[NTRK];
@@ -670,6 +733,7 @@ static uint32_t track_render(track_t *t, int32_t *out, uint32_t n)
     int32_t tune_fine = (song.g[G_TUNE] * 16 - tune * 100) * 2367 / 16000;   /* rest, in 1/4096 (1 ct = 2.367) */
     int32_t bend, bend16, bend_fine;
     uint32_t ti = (uint32_t)(t - trk);
+    int mpe_live = song.g[G_ROUTE] == ROUT_MPE || MOD(t).mpe;   /* (MPE fork: the voices' own work, else none) */
     if (ENGINES[eng_idx(t->eng_req)] == &ENG_DRUM) {
         midi_bend_q8[ti] = midi_bend_target[ti] = 0;
     } else {
@@ -704,7 +768,7 @@ static uint32_t track_render(track_t *t, int32_t *out, uint32_t n)
     for (i = 0; i < NVOICE; i++) {
         voice_t *v = &t->v[i];
         vmod_t m;
-        int32_t env, pitch;
+        int32_t env, pitch, bend_v;
         if (!v->active)
             continue;
         {
@@ -739,18 +803,24 @@ static uint32_t track_render(track_t *t, int32_t *out, uint32_t n)
         }
         if (!env && !m.amp0 && v->stage == 2 && !e->sampled)
             continue;                                   /* held at a silent sustain (SUS 0): nothing to render */
-        pitch = v->pitch_cur + tune + bend16 + ((lfo * p[P_LD_PIT] * 3) >> 15) + ((m.envq15 * p[P_ED_PIT] * 3) >> 15);
-        m.pitch16 = clamp(pitch, 0, 2047);
-        m.inc = pitch_inc(m.pitch16);
-        m.fine = v->fine + tune_fine + bend_fine;
-        if (v->fine + tune_fine + bend_fine)             /* residual below 1/16 semitone */
-            m.inc += (uint32_t)((int32_t)(m.inc >> 12) * (v->fine + tune_fine + bend_fine));
+        {
+            int32_t b16 = bend16, bfine = bend_fine;
+            if (mpe_live)                               /* MPE: this note's own bend, press, slide (mpe_voice) */
+                mpe_voice(t, ti, i, bend, &b16, &bfine);
+            pitch = v->pitch_cur + tune + b16 + ((lfo * p[P_LD_PIT] * 3) >> 15) + ((m.envq15 * p[P_ED_PIT] * 3) >> 15);
+            m.pitch16 = clamp(pitch, 0, 2047);
+            m.inc = pitch_inc(m.pitch16);
+            bend_v = bfine;
+        }
+        m.fine = v->fine + tune_fine + bend_v;
+        if (v->fine + tune_fine + bend_v)                /* residual below 1/16 semitone */
+            m.inc += (uint32_t)((int32_t)(m.inc >> 12) * (v->fine + tune_fine + bend_v));
         m.cutoff = ((lfo * p[P_LD_FLT]) >> 7) + ((m.envq15 * p[P_ED_FLT]) >> 7);
         if (v->vel > 110)                               /* accent opens the filter with the env */
             m.cutoff += (m.envq15 * 24) >> 7;
         m.shape = (64 << 8) + ((lfo * p[P_LD_SHP]) >> 7) + ((m.envq15 * p[P_ED_SHP]) >> 7);
         if (MOD(t).on)                                  /* the modulation matrix (mod.c) */
-            mod_voice(t, v, &m, v->fine + tune_fine + bend_fine);
+            mod_voice(t, v, &m, v->fine + tune_fine + bend_v);
         e->render(t, v, T_SPREAD(t) > v->side ? SPREAD_BUF(t) : out, n, &m);   /* (SPREAD: the left ones) */
         nr++;
     }

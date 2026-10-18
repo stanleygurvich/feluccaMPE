@@ -17,6 +17,18 @@
  *   SLEW  (#132) S&H slewed: it glides linearly from the cycle before's value to this cycle's over the cycle
  *         (a smooth random line, one cycle behind S&H, continuous where S&H steps); bipolar
  *   Both are per track (one value for every voice) and cost no state but the one value kept per cycle.
+ *   PRES  (MPE fork) the voice's finger pressure: its MIDI IN MPE member channel's channel pressure, smoothed;
+ *         with another MIDI IN the track's channel aftertouch (as AT), 0..1
+ *   TIMB  (MPE fork) the voice's Slide: its member channel's CC74, smoothed; 0 outside MPE, 0..1
+ *   VLFO  (MPE fork) the track LFO read at a phase of the voice's own: voice slot k at k x 45 degrees (8 slots round
+ *         the cycle), so the notes of a chord move out of step (ensemble, drift at a slow RATE). Its RATE / SYNC /
+ *         WAVE / FADE and the matrix's DEPTH as LFO; WAVE S&H is one value per cycle, the same for every voice. Always
+ *         bipolar, as S&H and SLEW (POL UNI does not apply: per voice it would cost the audio loop). On a per-track
+ *         destination it is the LFO
+ *   DRIFT (MPE fork) a slow random wander of the voice's own, the LFO left free: every voice (track x 8 + slot) heads
+ *         for a new random target every 4096 blocks (~3 s), a straight glide between them, each voice at its own
+ *         point of the cycle (a golden-ratio share apart), so no two turn at once. One global block count and a fixed
+ *         seed (drift_val): no state per track or voice. Bipolar; on a per-track destination the latest note's voice
  * Destinations:
  *   per voice (vmod_t, like the fixed routings):
  *     PITCH  AMT 63 at a full source = +-11.8 semitones (as LFO DEST PIT)
@@ -50,15 +62,36 @@
  * presets read and write t->p from the main loop, which the ISR preempts; TIMER5 only fills the MIDI rings),
  * and the engines read t->p as before. An engine reads its parameters in note_on (events_block) unmodulated.
  * Nothing active (every slot with SRC, DST or AMT at 0): no work, and the sound is bit-identical. */
-enum { MS_OFF, MS_LFO, MS_ENV, MS_VEL, MS_KEY, MS_RAND, MS_MODW, MS_AT, MS_EXPR, MS_SH, MS_SLEW, MS_N };
+enum { MS_OFF, MS_LFO, MS_ENV, MS_VEL, MS_KEY, MS_RAND, MS_MODW, MS_AT, MS_EXPR, MS_SH, MS_SLEW, MS_PRES, MS_TIMB, MS_VLFO, MS_DRIFT, MS_N };
 enum { MD_OFF, MD_PITCH, MD_CUT, MD_SHP, MD_AMP, MD_PAN, MD_DIST, MD_CHO, MD_DLY, MD_REV, MD_RATE, MD_VIB, MD_E1,
        MD_DEPTH = MD_E1 + 8, MD_VEL, MD_TIME, MD_N };   /* (append-only: the stored values keep their meaning) */
 _Static_assert(NELEM(N_MSRC) == MS_N && NELEM(N_MDST) == MD_N, "N_MSRC / N_MDST == MS_* / MD_*");
 _Static_assert(P_M2SRC == P_M1SRC + 3 && P_M4AMT == P_M1SRC + 11 && P_M4AMT + 1 == P_FM1_ATK, "matrix slots: 3 ids each");
 #define NMSLOT 4u
-#define MS_VOICE(s) ((s) >= MS_ENV && (s) <= MS_RAND)             /* a value per voice */
-#define MS_BIPOLAR(s) ((s) == MS_LFO || (s) == MS_KEY || (s) == MS_RAND || (s) >= MS_SH)
+#define MS_VOICE(s) (((s) >= MS_ENV && (s) <= MS_RAND) || (s) >= MS_PRES)   /* a value per voice (MPE: PRES TIMB) */
+#define MS_BIPOLAR(s) ((s) == MS_LFO || (s) == MS_KEY || (s) == MS_RAND || (s) == MS_SH || (s) == MS_SLEW || (s) == MS_VLFO || (s) == MS_DRIFT)
 #define MD_ENGINE(d) ((d) >= MD_E1 && (d) < MD_E1 + 8)           /* E1..E8: P_E0..P_E7 */
+
+/* the fork's per-voice sources as MOD(t).mpe's bits (a table: no compares in mod_begin's loop) */
+static const uint8_t MPE_BIT[MS_N] = {[MS_PRES] = 1u, [MS_TIMB] = 1u, [MS_VLFO] = 2u, [MS_DRIFT] = 4u};
+
+/* DRIFT: a random value -32768..32767 for cycle k of voice id (hashed with one seed: no state) */
+static int32_t drift_hash(uint32_t k, uint32_t id)
+{
+    uint32_t x = k * 0x9E3779B1u ^ id * 0x85EBCA77u ^ 0x2545F491u;
+    x ^= x >> 15;
+    x *= 0x2C1B3C6Du;
+    x ^= x >> 12;
+    return (int32_t)(x >> 16) - 32768;
+}
+/* voice id's drift now: a glide from its cycle's random value to the next one's, ~3 s a cycle (noinline: out of
+ * mod_begin's and the audio ISR's loops) */
+static __attribute__((noinline)) int32_t drift_val(uint32_t id)
+{
+    uint32_t t = drift_t + id * 2531u, k = t >> 12, f = t & 4095u;   /* (2531 / 4096: a golden-ratio share apart) */
+    int32_t a = drift_hash(k, id), b = drift_hash(k + 1u, id);
+    return a + (((b - a) * (int32_t)f) >> 12);
+}
 
 /* the track parameter of a per-block destination */
 static uint32_t mod_param(uint32_t d)
@@ -72,6 +105,7 @@ typedef struct {                 /* a part's, while mix_part renders it (one per
     uint8_t on;                  /* a slot is active: track_render calls mod_voice */
     uint8_t amp;                 /* an AMP slot: the voice gain applies */
     uint8_t nv, nk;              /* voice terms, per-block parameters held */
+    uint8_t mpe;                 /* MPE fork: bit 0 a slot takes PRES or TIMB, 1 VLFO, 2 DRIFT (track_render's mpe_voice) */
     int32_t pit, cut, shp, gain; /* per voice, from the per-track sources (gain Q15) */
     int32_t ldep;                /* DEPTH: the track LFO's gain (Q15; 32767 = none, track_render leaves it alone) */
     uint8_t vsrc[NMSLOT], vdst[NMSLOT];
@@ -124,6 +158,14 @@ static int32_t mod_tsrc(const track_t *t, uint32_t s, int32_t lfo)
         return t->mw * 258;
     case MS_AT:
         return t->at * 258;
+    case MS_PRES:                                       /* MPE: the latest note's (its voice's) press / slide */
+        return mpe_vpres[t - trk][t->m_vi];
+    case MS_TIMB:
+        return mpe_vtimb[t - trk][t->m_vi];
+    case MS_VLFO:                                       /* (per track: the LFO itself) */
+        return lfo;
+    case MS_DRIFT:                                      /* (per track: the latest note's voice's) */
+        return drift_val(t->m_vi);
     default:
         return (127 - t->ex_off) * 258;
     }
@@ -174,7 +216,7 @@ static __attribute__((noinline)) int mod_begin(track_t *t)
     int32_t lfo, off[NMSLOT];
     uint32_t k, j;
     modw_t *mw = &MOD(t);
-    mw->on = 0;
+    mw->on = mw->mpe = 0;
     for (k = 0; k < NMSLOT; k++)                        /* (VEL and TIME: at the notes, not here) */
         if (p[P_M1SRC + 3u * k] && p[P_M1DST + 3u * k] && p[P_M1AMT + 3u * k] && p[P_M1DST + 3u * k] < MD_VEL)
             break;
@@ -194,6 +236,7 @@ static __attribute__((noinline)) int mod_begin(track_t *t)
         int32_t a = p[P_M1AMT + 3u * k], x;
         if (!s || !d || !a || s >= MS_N || d >= MD_DEPTH)
             continue;
+        mw->mpe |= MPE_BIT[s];
         if (d <= MD_AMP) {                              /* per voice */
             mw->amp |= d == MD_AMP;
             if (MS_VOICE(s)) {
@@ -236,7 +279,7 @@ static __attribute__((noinline)) void mod_end(track_t *t)
     modw_t *mw = &MOD(t);
     for (j = 0; j < mw->nk; j++)
         t->p[mw->kid[j]] = mw->keep[j];
-    mw->on = 0;
+    mw->on = mw->mpe = 0;
 }
 
 /* a voice's modulation (voice.c track_render, when mw->on), onto its vmod_t m as track_render made it:
@@ -251,7 +294,8 @@ static __attribute__((noinline)) void mod_voice(track_t *t, voice_t *v, vmod_t *
         t->m_env = env;                                 /* ENV of the latest note, for per-block destinations */
     for (k = 0; k < mw->nv; k++) {
         uint32_t s = mw->vsrc[k];
-        int32_t x = s == MS_ENV ? env : s == MS_VEL ? v->mvel * 258 : s == MS_KEY ? mod_key(v->note) : v->mrnd;
+        int32_t x = s == MS_ENV ? env : s == MS_VEL ? v->mvel * 258 : s == MS_KEY ? mod_key(v->note) :
+                    s >= MS_PRES ? mpe_cur[C1_PI(t)][s - MS_PRES] : v->mrnd;
         mod_voice_add(s, mw->vdst[k], x, mw->vamt[k], &pit, &cut, &shp, &gain);
     }
     if (pit) {

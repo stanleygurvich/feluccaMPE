@@ -11,6 +11,9 @@ static void midi_test_reset(void)
     memset(midi_owners, 0, sizeof midi_owners); memset(midi_bend_q8, 0, sizeof midi_bend_q8);
     memset(midi_bend_target, 0, sizeof midi_bend_target); memset(&midi_clock, 0, sizeof midi_clock);
     memset(&um, 0, sizeof um); memset(midi_in_source, 0, sizeof midi_in_source);
+    memset(mpe_vch, 0, sizeof mpe_vch); memset(mpe_vbend, 0, sizeof mpe_vbend); memset(mpe_ch_bend, 0, sizeof mpe_ch_bend);
+    memset(mpe_ch_pres, 0, sizeof mpe_ch_pres); memset(mpe_ch_timb, 0, sizeof mpe_ch_timb);
+    memset(mpe_vpres, 0, sizeof mpe_vpres); memset(mpe_vtimb, 0, sizeof mpe_vtimb);
     mi_r = mi_w = 0; midi_in_overflow = 0; midi_beat_samples = 0;
     fm1_in.notes = kb_prev = 0; fm1_ms = 0; song.sel = 0;
     memset(song.mch, 0, sizeof song.mch); song.g[G_ROUTE] = 0; midi_seen = 0; memset(midi_lit_ms, 0, sizeof midi_lit_ms);
@@ -286,11 +289,11 @@ static int route_test(void)
 static uint32_t out_last(void) { return mo_w != mo_r ? midi_out_q[(mo_w - 1u) % MQ] : 0u; }
 static int route_block_test(void)
 {
-    static const char *const NAME[6] = {"CH1-4", "SEL", "CH5-8", "CH9-12", "CH13-16", "TRACK"};
+    static const char *const NAME[7] = {"CH1-4", "SEL", "CH5-8", "CH9-12", "CH13-16", "TRACK", "MPE"};
     int bad = 0, ok = 1; uint32_t r, ch, i;
-    ok = GP[G_ROUTE].max == 5 && GP[G_ROUTE].def == 0 && ROUTE_TRACK == 5;
-    for (r = 0; r < 6u; r++) ok &= str_eq(GP[G_ROUTE].names[r], NAME[r]);
-    bad += check("ROUT: CH1-4 SEL (stored 0 1, as before), CH5-8 CH9-12 CH13-16 appended, 1.5.5 TRACK", ok);
+    ok = GP[G_ROUTE].max == 6 && GP[G_ROUTE].def == 0 && ROUTE_TRACK == 5 && ROUT_MPE == 6;
+    for (r = 0; r < 7u; r++) ok &= str_eq(GP[G_ROUTE].names[r], NAME[r]);
+    bad += check("ROUT: CH1-4 SEL (stored 0 1, as before), CH5-8 CH9-12 CH13-16 appended, 1.5.5 TRACK, MPE (this fork) last", ok);
     for (r = 2; r <= 4u; r++) {
         uint32_t b = (r - 1u) * 4u;
         midi_test_reset(); song.sel = 2; song.g[G_ROUTE] = (int16_t)r;
@@ -979,9 +982,267 @@ static int pc_test(void)
     bad += check("  MIDI LEARN waiting: a PC is not taken for a CC, it loads", ok);
     return bad;
 }
+
+/* MPE fork: MIDI IN MPE (G_ROUTE 6). A lower zone on the selected track: channel 1 the master (the track's bend as
+ * before), 2..16 a note each with its own bend (voice.c mpe_*), +-48 semitones by default, RPN 0 per channel up to 96;
+ * a note let go keeps its bend (the channel can start the next note); leaving MPE gives the channels their 2 back */
+static int voice_of(const track_t *t, uint32_t note)
+{
+    for (uint32_t i = 0; i < NVOICE; i++) if (t->v[i].active && t->v[i].note == note) return (int)i;
+    return -1;
+}
+static void render_n(track_t *t, uint32_t n) { int32_t out[CTL]; while (n--) track_render(t, out, CTL); }
+static int mpe_test(void)
+{
+    int bad = 0, a, b, c; midi_test_reset(); song.sel = 1; track_t *t = &trk[1];
+    t->p[P_VOICE] = V_POLY; t->p[P_GLIDE] = 0;
+    song.g[G_ROUTE] = ROUT_MPE; events_block(CTL);
+    bad += check("MPE: members' bend range is 48 semitones, the master's stays 2",
+                 midi_ch[1].semis == 48 && midi_ch[15].semis == 48 && midi_channel(0)->semis == 2);
+    queued(0x91, 60, 100, 1); queued(0x92, 64, 100, 1); queued(0x93, 67, 100, 1);
+    a = voice_of(t, 60); b = voice_of(t, 64); c = voice_of(t, 67);
+    bad += check("MPE: notes on channels 2..4 play the selected track, a voice each", a >= 0 && b >= 0 && c >= 0 &&
+                 gate_note(t, 60) && gate_note(t, 64) && gate_note(t, 67) && !gate_note(&trk[0], 60));
+    bad += check("MPE: each voice knows its channel", a >= 0 && b >= 0 && mpe_vch[1][a] == 2 && mpe_vch[1][b] == 3 && mpe_vch[1][c] == 4);
+    queued(0xE1, 127, 127, 1);                                     /* channel 2: full up, +48 */
+    queued(0xE2, 0, 32, 1);                                        /* channel 3: half down, -24 */
+    render_n(t, 64);
+    bad += check("MPE: channel 2's bend moves its note alone (+48 st), smoothed onto it exactly",
+                 a >= 0 && mpe_vbend[1][a] == 48 * 256 && mpe_vbend[1][c] == 0);
+    bad += check("MPE: channel 3's bend moves its own note (-24 st)", b >= 0 && mpe_vbend[1][b] == -24 * 256);
+    bad += check("MPE: members' bends leave the track's bend alone", midi_bend_target[1] == 0 && midi_bend_q8[1] == 0);
+    queued(0xE0, 127, 127, 1); render_n(t, 64);
+    bad += check("MPE: the master channel bends the whole track (+2), the notes' own bends on top",
+                 midi_bend_target[1] == 512 && midi_bend_q8[1] == 512 && mpe_vbend[1][a] == 48 * 256);
+    queued(0xE0, 0, 64, 1);
+    queued(0xE4, 0, 80, 1); queued(0x94, 72, 100, 1);              /* bend first (+2048: +12 st), then the note, as controllers do */
+    { int d = voice_of(t, 72);
+      bad += check("MPE: a bend sent before the note-on applies from its first block", d >= 0 && mpe_vbend[1][d] == 2048 * (48 * 256) / 8191 &&   /* +2048 of 8191: +12 st */
+                   mpe_vch[1][d] == 5); }
+    queued(0x81, 60, 0, 1);
+    bad += check("MPE: a note let go frees its channel but keeps its bend for the release",
+                 a >= 0 && !t->v[a].gate && mpe_vch[1][a] == 0 && mpe_vbend[1][a] == 48 * 256);
+    queued(0xE1, 0, 64, 1); queued(0x91, 62, 100, 1); render_n(t, 64);
+    bad += check("MPE: the channel's next note starts unbent; the released one did not move",
+                 voice_of(t, 62) >= 0 && mpe_vbend[1][voice_of(t, 62)] == 0 && (t->v[a].active ? mpe_vbend[1][a] == 48 * 256 : 1));
+    queued(0xB5, 101, 0, 1); queued(0xB5, 100, 0, 1); queued(0xB5, 6, 96, 1); queued(0xE5, 127, 127, 1);
+    bad += check("MPE: RPN 0 on a member sets its range, up to 96 semitones", midi_ch[5].semis == 96 && mpe_ch_bend[5] == 96 * 256);
+    queued(0xB6, 101, 0, 1); queued(0xB6, 100, 0, 1); queued(0xB6, 6, 127, 1);
+    bad += check("MPE: a member's range is capped at 96", midi_ch[6].semis == 96);
+    song.g[G_ROUTE] = 0; events_block(CTL);
+    queued(0xB1, 101, 0, 1); queued(0xB1, 100, 0, 1); queued(0xB1, 6, 48, 1); queued(0xE1, 127, 127, 1);
+    bad += check("CH1-4 (mock MPE): RPN 0 of 48 is taken, the track bends +48", midi_ch[1].semis == 48 && midi_bend_target[1] == 48 * 256);
+    song.g[G_ROUTE] = ROUT_MPE; events_block(CTL);
+    song.g[G_ROUTE] = 1; events_block(CTL);
+    bad += check("MPE off (SEL): members' range back to 2, no voice follows a channel",
+                 midi_ch[1].semis == 2 && midi_ch[5].semis == 2 && !mpe_vch[1][b] && !mpe_vch[1][c]);
+    queued(0xE2, 127, 127, 1);
+    bad += check("MPE off: a channel's bend is the track's again, as before", midi_bend_target[1] == 512);
+    queued(0xB2, 101, 0, 1); queued(0xB2, 100, 0, 1); queued(0xB2, 6, 12, 1);
+    song.g[G_ROUTE] = 0; events_block(CTL); song.g[G_ROUTE] = 1; events_block(CTL);
+    bad += check("SEL -> CH1-4 -> SEL keeps a channel's RPN 0 range (12), as upstream does", midi_ch[2].semis == 12);
+    return bad;
+}
+/* MPE: two fingers on the same key are two voices, each with its bend; letting go of one ends only its own */
+static int mpe_same_note_test(void)
+{
+    int bad = 0, n = 0, v2 = -1, v3 = -1; midi_test_reset(); song.sel = 2; track_t *t = &trk[2];
+    t->p[P_VOICE] = V_POLY; t->p[P_GLIDE] = 0;
+    song.g[G_ROUTE] = ROUT_MPE; events_block(CTL);
+    queued(0x91, 57, 100, 1); queued(0x92, 57, 100, 1);
+    for (uint32_t i = 0; i < NVOICE; i++)
+        if (t->v[i].active && t->v[i].gate && t->v[i].note == 57) { n++; if (mpe_vch[2][i] == 2) v2 = (int)i; if (mpe_vch[2][i] == 3) v3 = (int)i; }
+    bad += check("MPE: the same note on channels 2 and 3 is two voices, one per channel", n == 2 && v2 >= 0 && v3 >= 0);
+    queued(0xE2, 127, 127, 1); render_n(t, 64);
+    bad += check("MPE: bending channel 3 moves its A3 only", v3 >= 0 && v2 >= 0 && mpe_vbend[2][v3] == 48 * 256 && mpe_vbend[2][v2] == 0);
+    queued(0x81, 57, 0, 1);
+    bad += check("MPE: channel 2's note-off ends its voice; channel 3's A3 keeps sounding",
+                 v2 >= 0 && v3 >= 0 && !t->v[v2].gate && t->v[v3].gate && t->v[v3].note == 57);
+    queued(0x82, 57, 0, 1);
+    bad += check("MPE: then channel 3's note-off ends the last one, nothing owned", v3 >= 0 && !t->v[v3].gate && !midi_owners[2]);
+    song.g[G_ROUTE] = 1; events_block(CTL);
+    queued(0x91, 57, 100, 1); queued(0x92, 57, 100, 1); n = 0;
+    for (uint32_t i = 0; i < NVOICE; i++) n += t->v[i].active && t->v[i].gate && t->v[i].note == 57;
+    bad += check("SEL (not MPE): the same note on two channels is still one voice, as before", n == 1);
+    queued(0x81, 57, 0, 1); queued(0x82, 57, 0, 1);
+    song.g[G_ROUTE] = 0; events_block(CTL);
+    return bad;
+}
+/* MPE: MIDI IN changed while notes are held (the user's report: a note hung until MIDI IN went back to CH1-4) */
+static int mpe_switch_test(void)
+{
+    int bad = 0; midi_test_reset(); track_t *t1 = &trk[1], *t0 = &trk[0];
+    t1->p[P_VOICE] = V_POLY; t0->p[P_VOICE] = V_POLY;
+    song.g[G_ROUTE] = 0; events_block(CTL); song.sel = 0;
+    queued(0x91, 62, 100, 1);                                      /* CH1-4: channel 2 plays track 2 */
+    queued(0xE1, 127, 127, 1);                                     /* .. and bends it (+2) */
+    bad += check("switch: before, CH1-4 plays and bends channel 2's track", gate_note(t1, 62) && midi_bend_target[1] == 512);
+    song.g[G_ROUTE] = ROUT_MPE; events_block(CTL);                 /* MIDI IN -> MPE with the note held */
+    bad += check("switch into MPE: the old routing's bend is dropped from the track", midi_bend_target[1] == 0);
+    queued(0x81, 62, 0, 1);
+    bad += check("switch into MPE: the held note's note-off ends it (no hanging note)", !gate_note(t1, 62) && !midi_owners[1]);
+    song.g[G_ROUTE] = 1; events_block(CTL); song.sel = 0;          /* SEL: channel 3 plays the selected track */
+    queued(0x92, 64, 100, 1);
+    song.g[G_ROUTE] = ROUT_MPE; events_block(CTL);
+    queued(0x82, 64, 0, 1);
+    bad += check("SEL -> MPE with a note held: its note-off ends it", !gate_note(t0, 64) && !midi_owners[0]);
+    queued(0x93, 65, 100, 1);                                      /* MPE: a finger on channel 4 */
+    song.g[G_ROUTE] = 1; events_block(CTL);
+    queued(0x83, 65, 0, 1);
+    bad += check("MPE -> SEL with a finger held: its note-off ends it", !gate_note(t0, 65) && !midi_owners[0]);
+    queued(0x94, 67, 100, 1);
+    song.g[G_ROUTE] = ROUT_MPE; events_block(CTL); song.g[G_ROUTE] = 0; events_block(CTL);
+    bad += check("MPE -> CH1-4 with a note held on channel 5: let go at the switch, as upstream does", !gate_note(t0, 67) && !midi_owners[0]);
+    song.g[G_ROUTE] = 0; events_block(CTL);
+    return bad;
+}
+/* MPE milestone 2: Press and Slide per finger, the matrix's PRES and TIMB (per voice) */
+static double tone(track_t *t, double hz, uint32_t blocks)
+{
+    double c = 2 * cos(2 * 3.141592653589793 * hz / FS), s1 = 0, s2 = 0; int32_t out[CTL]; uint32_t n = 0;
+    while (blocks--) { track_render(t, out, CTL); for (uint32_t i = 0; i < CTL; i++, n++) { double s0 = out[i] + c * s1 - s2; s2 = s1; s1 = s0; } }
+    return sqrt(s1 * s1 + s2 * s2 - c * s1 * s2) / n;
+}
+static int mpe_press_test(void)
+{
+    int bad = 0; midi_test_reset(); song.sel = 0; track_t *t = &trk[0]; int a, b;
+    t->p[P_VOICE] = V_POLY; t->p[P_GLIDE] = 0;
+    song.g[G_ROUTE] = ROUT_MPE; events_block(CTL);
+    bad += check("MPE 2: the matrix lists PRES and TIMB after SLEW", str_eq(TP[P_M1SRC].names[MS_PRES], "PRES") &&
+                 str_eq(TP[P_M1SRC].names[MS_TIMB], "TIMB") && TP[P_M1SRC].max == MS_N - 1 && MS_TIMB == MS_N - 3);
+    queued(0xD1, 0, 0, 1); queued(0xB1, 74, 64, 1); queued(0x91, 57, 100, 1);   /* finger 1: A3, no press, slide 64 */
+    queued(0xD2, 100, 0, 1); queued(0x92, 63, 100, 1);                          /* finger 2: D#4 (no harmonic of A3), pressed first */
+    a = voice_of(t, 57); b = voice_of(t, 63);
+    bad += check("MPE 2: a finger's press and slide sent before its note apply at once", a >= 0 && b >= 0 &&
+                 mpe_vpres[0][b] == 100 * 258 && mpe_vpres[0][a] == 0 && mpe_vtimb[0][a] == 64 * 258);
+    t->p[P_M2SRC] = MS_TIMB; t->p[P_M2DST] = MD_SHP; t->p[P_M2AMT] = 1;   /* (the values follow while a slot takes them) */
+    queued(0xD1, 127, 0, 1); queued(0xB1, 74, 127, 1);
+    { int32_t out[CTL]; for (int k = 0; k < 32; k++) { mod_begin(t); track_render(t, out, CTL); mod_end(t); } }
+    t->p[P_M2SRC] = t->p[P_M2DST] = t->p[P_M2AMT] = 0;
+    bad += check("MPE 2: channel 2's press and slide reach its voice alone (smoothed onto them, while a slot takes them)", a >= 0 && b >= 0 &&
+                 mpe_vpres[0][a] == 127 * 258 && mpe_vtimb[0][a] == 127 * 258 && mpe_vpres[0][b] == 100 * 258 && mpe_vtimb[0][b] == 0);
+    bad += check("MPE 2: members' press is not the track's AT, their slide not its CC74 map", t->at == 0);
+    t->p[P_M1SRC] = MS_PRES; t->p[P_M1DST] = MD_AMP; t->p[P_M1AMT] = 63;        /* PRES -> AMP: a finger sounds as hard as it presses */
+    queued(0xD1, 127, 0, 1); queued(0xD2, 0, 0, 1);
+    { int32_t out[CTL]; for (int k = 0; k < 64; k++) { mod_begin(t); track_render(t, out, CTL); mod_end(t); } }
+    double l220 = 0, l440 = 0;
+    { int32_t out[CTL]; double c1 = 2 * cos(2 * 3.141592653589793 * 220.0 / FS), c2 = 2 * cos(2 * 3.141592653589793 * 311.127 / FS), a1 = 0, a2 = 0, b1 = 0, b2 = 0; uint32_t n = 0;
+      for (int k = 0; k < 128; k++) { mod_begin(t); track_render(t, out, CTL); mod_end(t);
+        for (uint32_t i = 0; i < CTL; i++, n++) { double x = out[i], s0 = x + c1 * a1 - a2; a2 = a1; a1 = s0; s0 = x + c2 * b1 - b2; b2 = b1; b1 = s0; } }
+      l220 = sqrt(a1 * a1 + a2 * a2 - c1 * a1 * a2) / n; l440 = sqrt(b1 * b1 + b2 * b2 - c2 * b1 * b2) / n; }
+    printf("    PRES -> AMP, finger 1 pressed, finger 2 not: 220 Hz %.1f, 311 Hz %.1f\n", l220, l440);
+    bad += check("MPE 2: PRES -> AMP: the pressed finger (A3) sounds, the unpressed one (D#4) is silent", l220 > 20 * l440 && l220 > 1);
+    queued(0xD1, 0, 0, 1); queued(0xD2, 127, 0, 1);
+    { int32_t out[CTL]; double c1 = 2 * cos(2 * 3.141592653589793 * 220.0 / FS), c2 = 2 * cos(2 * 3.141592653589793 * 311.127 / FS), a1 = 0, a2 = 0, b1 = 0, b2 = 0; uint32_t n = 0;
+      for (int k = 0; k < 64; k++) { mod_begin(t); track_render(t, out, CTL); mod_end(t); }
+      for (int k = 0; k < 128; k++) { mod_begin(t); track_render(t, out, CTL); mod_end(t);
+        for (uint32_t i = 0; i < CTL; i++, n++) { double x = out[i], s0 = x + c1 * a1 - a2; a2 = a1; a1 = s0; s0 = x + c2 * b1 - b2; b2 = b1; b1 = s0; } }
+      double m220 = sqrt(a1 * a1 + a2 * a2 - c1 * a1 * a2) / n, m440 = sqrt(b1 * b1 + b2 * b2 - c2 * b1 * b2) / n;
+      printf("    .. swapped: 220 Hz %.1f, 311 Hz %.1f\n", m220, m440);
+      bad += check("MPE 2: .. and swapped: now only D#4 sounds", m440 > 20 * m220 && m440 > 1); }
+    t->p[P_M1SRC] = t->p[P_M1DST] = t->p[P_M1AMT] = 0;
+    queued(0x81, 57, 0, 1); queued(0xD1, 50, 0, 1); render_n(t, 32);
+    bad += check("MPE 2: a released finger keeps its press (the channel's next values are another note's)", a >= 0 && mpe_vpres[0][a] == 0);
+    song.g[G_ROUTE] = 1; events_block(CTL);
+    queued(0xD3, 90, 0, 1); queued(0x93, 60, 100, 1); render_n(t, 32);
+    bad += check("MPE 2: outside MPE, PRES is the track's aftertouch, TIMB 0", voice_of(t, 60) >= 0 && t->at == 90 &&
+                 mpe_vpres[0][voice_of(t, 60)] == 90 * 258 && mpe_vtimb[0][voice_of(t, 60)] == 0);
+    queued(0x83, 60, 0, 1); queued(0x82, 63, 0, 1);
+    song.g[G_ROUTE] = 0; events_block(CTL);
+    return bad;
+}
+/* MPE fork: VLFO, the track LFO at each voice slot's own phase: a chord's notes move out of step (LFO: together) */
+static double vlfo_peak(const float *x, int n, double f) {
+  double best = 0, bf = f;
+  for (int c = -150; c <= 150; c += 2) { double g = f * pow(2, c / 1200.0), w = 2 * cos(2 * 3.141592653589793 * g / FS), s1 = 0, s2 = 0;
+    for (int i = 0; i < n; i++) { double s0 = x[i] + w * s1 - s2; s2 = s1; s1 = s0; }
+    double e = s1 * s1 + s2 * s2 - w * s1 * s2; if (e > best) { best = e; bf = g; } }
+  return bf;
+}
+/* one block of part t as mix_block renders it: the matrix around track_render, then (two cores) the LFO's block's end */
+static void vlfo_block(track_t *t, int32_t *o)
+{
+  mod_begin(t); track_render(t, o, CTL); mod_end(t);
+#if FELUCCA_CPU2
+  track_lfo_end(t);
+#endif
+}
+static double vlfo_spread(uint32_t src)   /* the widest gap between the chord's notes (cents) over 10 windows of ~0.18 s */
+{
+  static float X[8000];
+  midi_test_reset(); song.sel = 0; track_t *t = &trk[0]; t->p[P_VOICE] = V_POLY; t->p[P_GLIDE] = 0;
+  song.g[G_ROUTE] = 1; events_block(CTL);
+  t->p[P_LWAVE] = 0; t->p[P_LRATE] = 40; t->p[P_LFADE] = 0;
+  t->p[P_M1SRC] = (int16_t)src; t->p[P_M1DST] = MD_PITCH; t->p[P_M1AMT] = 6;
+  queued(0x90, 45, 100, 1); queued(0x90, 51, 100, 1); queued(0x90, 56, 100, 1);
+  int32_t o[CTL]; double worst = 0;
+  for (int k = 0; k < 64; k++) vlfo_block(t, o);
+  for (int w = 0; w < 10; w++) {
+    int n = 0; double c[3]; const double f[3] = {110.0, 155.563, 207.652};
+    while (n + CTL <= 8000) { vlfo_block(t, o); for (int i = 0; i < CTL; i++) X[n++] = o[i]; }
+    for (int j = 0; j < 3; j++) c[j] = 1200 * log2(vlfo_peak(X, n, f[j]) / f[j]);
+    double lo = fmin(c[0], fmin(c[1], c[2])), hi = fmax(c[0], fmax(c[1], c[2]));
+    worst = fmax(worst, hi - lo);
+  }
+  queued(0x80, 45, 0, 1); queued(0x80, 51, 0, 1); queued(0x80, 56, 0, 1);
+  t->p[P_M1SRC] = t->p[P_M1DST] = t->p[P_M1AMT] = 0; song.g[G_ROUTE] = 0; events_block(CTL);
+  return worst;
+}
+static int vlfo_test(void)
+{
+  int bad = 0;
+  double a = vlfo_spread(MS_LFO), b = vlfo_spread(MS_VLFO);
+  printf("    chord on PITCH (note), AMT 6: widest gap between its notes: LFO %.0f ct, VLFO %.0f ct\n", a, b);
+  bad += check("VLFO: listed after TIMB", str_eq(TP[P_M1SRC].names[MS_VLFO], "VLFO") && MS_VLFO == MS_N - 2);
+  bad += check("VLFO: LFO -> PITCH moves a chord's notes together (within 20 ct)", a < 20);
+  bad += check("VLFO: VLFO -> PITCH moves them out of step (over 60 ct apart at times)", b > 60);
+  return bad;
+}
+/* MPE fork: DRIFT, a slow random wander per voice (one global clock, one seed): each note of a chord on its own path */
+static int drift_test(void)
+{
+  static float X[8000]; double c[20][3], rng_[3] = {0}, gap = 0; int bad = 0;
+  midi_test_reset(); song.sel = 0; track_t *t = &trk[0]; t->p[P_VOICE] = V_POLY; t->p[P_GLIDE] = 0;
+  song.g[G_ROUTE] = 1; events_block(CTL);
+  t->p[P_M1SRC] = MS_DRIFT; t->p[P_M1DST] = MD_PITCH; t->p[P_M1AMT] = 2;
+  queued(0x90, 45, 100, 1); queued(0x90, 51, 100, 1); queued(0x90, 56, 100, 1);
+  const double f[3] = {110.0, 155.563, 207.652};
+  for (int w = 0; w < 20; w++) {
+    int32_t o[CTL]; int n = 0;
+    for (int k = 0; k < 600; k++) { drift_t++; vlfo_block(t, o); }   /* (drift_t: as mix_block) */
+    while (n + CTL <= 8000) { drift_t++; vlfo_block(t, o); for (int i = 0; i < CTL; i++) X[n++] = o[i]; }
+    for (int j = 0; j < 3; j++) c[w][j] = 1200 * log2(vlfo_peak(X, n, f[j]) / f[j]);
+    gap = fmax(gap, fmax(fabs(c[w][0] - c[w][1]), fmax(fabs(c[w][1] - c[w][2]), fabs(c[w][0] - c[w][2]))));
+  }
+  for (int j = 0; j < 3; j++) { double lo = 1e9, hi = -1e9; for (int w = 0; w < 20; w++) { lo = fmin(lo, c[w][j]); hi = fmax(hi, c[w][j]); } rng_[j] = hi - lo; }
+  printf("    DRIFT -> PITCH (note), AMT 2, 12 s: each note's range %.0f / %.0f / %.0f ct, widest gap between notes %.0f ct\n", rng_[0], rng_[1], rng_[2], gap);
+  bad += check("DRIFT: listed after VLFO", str_eq(TP[P_M1SRC].names[MS_DRIFT], "DRIFT") && MS_DRIFT == MS_N - 1);
+  bad += check("DRIFT: every note of a chord wanders (over 10 ct in 12 s)", rng_[0] > 10 && rng_[1] > 10 && rng_[2] > 10);
+  bad += check("DRIFT: .. each on its own path (over 20 ct apart at times)", gap > 20);
+  bad += check("DRIFT: .. within AMT 2's reach (+-50 ct)", rng_[0] < 100 && rng_[1] < 100 && rng_[2] < 100);
+  queued(0x80, 45, 0, 1); queued(0x80, 51, 0, 1); queued(0x80, 56, 0, 1);
+  t->p[P_M1SRC] = t->p[P_M1DST] = t->p[P_M1AMT] = 0; song.g[G_ROUTE] = 0; events_block(CTL);
+  return bad;
+}
+static int mpe_mono_test(void)
+{
+    int bad = 0; midi_test_reset(); song.sel = 0; track_t *t = &trk[0];
+    t->p[P_VOICE] = V_LEGATO; t->p[P_GLIDE] = 0;
+    song.g[G_ROUTE] = ROUT_MPE; events_block(CTL);
+    queued(0x91, 60, 100, 1); queued(0xE2, 127, 127, 1); queued(0x92, 64, 100, 1); render_n(t, 64);
+    bad += check("MPE LEGATO: the voice takes the new finger's channel and bend", t->v[0].note == 64 && mpe_vch[0][0] == 3 &&
+                 mpe_vbend[0][0] == 48 * 256);
+    queued(0x93, 36, 100, 1);
+    song.sel = 3; queued(0x93, 38, 100, 1);
+    bad += check("MPE: a DRUM track's voices follow no channel", voice_of(&trk[3], 38) < 0 || !mpe_vch[3][voice_of(&trk[3], 38)]);
+    song.g[G_ROUTE] = 0; events_block(CTL);
+    return bad;
+}
+
 int main(void)
 {
     int bad = controls_test() + sustain_test() + ownership_test() + clock_test(1) + clock_test(2) + clock_arp_and_boundaries() +
-              arp_ext_stop_test() + usb_burst_test() + route_test() + route_block_test() + route_track_test() + follow_test() + cc_map_test() + learn_test() + pc_test();
+              arp_ext_stop_test() + usb_burst_test() + route_test() + route_block_test() + route_track_test() + follow_test() + cc_map_test() + learn_test() + pc_test() +
+              mpe_test() + mpe_same_note_test() + mpe_switch_test() + mpe_press_test() + mpe_mono_test() + vlfo_test() + drift_test();
     printf("%s\n", bad ? "MIDI CONTROL/CLOCK TEST FAILED" : "MIDI control/clock integration tests passed"); return bad != 0;
 }

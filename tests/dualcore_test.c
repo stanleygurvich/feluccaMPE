@@ -49,6 +49,17 @@ static void part_setup(track_t *t, uint32_t k, uint32_t e)
         t->p[P_M2DST] = MD_RATE;                    /* (a per-block destination: t->p while it renders) */
         t->p[P_M2AMT] = 20;
     }
+    /* MPE fork: the per-voice sources (voice.c mpe_voice -> mod.c mod_voice through the part's own mpe_cur): VLFO on
+     * parts 1 and 2, DRIFT on 0 and 3, PRES (the track's AT here) on 2, so two parts on two cores use each at once */
+    t->p[P_M3SRC] = (int16_t)(k == 1u || k == 2u ? MS_VLFO : MS_DRIFT);
+    t->p[P_M3DST] = MD_PITCH;
+    t->p[P_M3AMT] = 4;
+    if (k == 2u) {
+        t->p[P_M4SRC] = MS_PRES;
+        t->p[P_M4DST] = MD_CUT;
+        t->p[P_M4AMT] = 30;
+        t->at = 90;
+    }
 }
 
 static uint64_t render(const scen_t *sc, int dual, const char *mask)
