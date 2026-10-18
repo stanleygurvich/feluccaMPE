@@ -1,5 +1,7 @@
 # Felucca MPE
 
+[www.stanleygurvich.com](https://www.stanleygurvich.com)
+
 **MPE (MIDI Polyphonic Expression) for the M-Vave FM-1, plus Voice LFO (VLFO) and DRIFT: chords that move and breathe, on any
 keyboard.** By Stanley Gurvich, Emerald Moon Labs.
 Built on [Felucca](https://github.com/hugelton/Felucca) 1.6.1 by Leo Kuroshita, Hügelton Instruments (GPL-3.0-only).
