@@ -6,7 +6,7 @@
 keyboard.** By Stanley Gurvich, Emerald Moon Labs.
 Built on [Felucca](https://github.com/hugelton/Felucca) 1.6.1 by Leo Kuroshita, Hügelton Instruments (GPL-3.0-only).
 
-**Branch:** `main` is Felucca MPE 1.6.1 (`mpe` is the same).
+**Branch:** `main` is Felucca MPE 1.6.1.
 
 > [!WARNING]
 > **Tested only in the emulator, not on a real FM-1.** Everything so far ran off the device: played in the browser
