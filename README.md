@@ -1,7 +1,10 @@
 # Felucca MPE
 
-**MPE (MIDI Polyphonic Expression) for the M-Vave FM-1.** By Stanley Gurvich, Emerald Moon Labs.
+**MPE (MIDI Polyphonic Expression) for the M-Vave FM-1, plus VLFO and DRIFT: chords that move and breathe, on any
+keyboard.** By Stanley Gurvich, Emerald Moon Labs.
 Built on [Felucca](https://github.com/hugelton/Felucca) 1.6.1 by Leo Kuroshita, Hügelton Instruments (GPL-3.0-only).
+
+**Branch:** `main` is Felucca MPE 1.6.1 (`mpe` is the same).
 
 > [!WARNING]
 > **Tested only in the emulator, not on a real FM-1.** Everything so far ran off the device: played in the browser
@@ -17,6 +20,24 @@ Built on [Felucca](https://github.com/hugelton/Felucca) 1.6.1 by Leo Kuroshita, 
 Played in the emulator with a **ROLI Seaboard RISE 49** and an **Embodme Erae Touch (Mk 1)**: it works, and it feels
 like any other MPE synth.
 
+## VLFO and DRIFT: every voice its own movement, no MPE controller needed
+
+Two new modulation sources give each note of a chord a life of its own. They work on any MIDI IN setting, on the
+FM-1's own keys and on its sequencer, and cost nothing while no slot uses them.
+
+- **VLFO (voice LFO):** the track's LFO, read at a different point of its cycle for each voice (the eight voice slots
+  sit 45° apart). With the plain LFO a chord's notes all move together; with VLFO they move out of step. **VLFO →
+  PITCH**, AMT 1–2 and a slow RATE: an ensemble, a gentle chorus made of the notes themselves. **VLFO → CUT**: a
+  chord that shimmers note by note. It follows the LFO's RATE, SYNC, WAVE, FADE and the matrix's DEPTH. It is
+  always bipolar (POL UNI doesn't apply), and on WAVE S&H every voice gets the same value.
+- **DRIFT:** a slow random wander, different for every voice, with the LFO left free for something else. Each voice
+  heads for a new random target about every 3 seconds and glides there, each at its own moment, so the notes drift
+  apart and back without ever repeating. **DRIFT → PITCH**, AMT 1 (about ±15 cents) or 2 (about ±30): the drift of
+  an old analog synth. **DRIFT → CUT**: a filter that breathes on every note.
+
+Set them on the MOD page: a slot's SRC to VLFO or DRIFT, its DST to PITCH, CUT, SHP or AMP (per note), and AMT to
+taste.
+
 ## What it does
 
 Felucca turns the FM-1 into a deep little synth and groovebox. Felucca MPE lets you play it from an MPE controller,
@@ -27,9 +48,7 @@ with every finger its own voice and its own expression:
 - **Press and Slide shape each note.** Two modulation sources, **PRES** (how hard you press) and **TIMB** (sliding
   along the key), go to any per-note destination: press harder for louder (AMP), slide to open the filter (CUT),
   press for vibrato (PITCH), or reshape the tone (SHP). Each finger moves only its own note.
-- **Chords that breathe, on any keyboard.** Two more sources work without MPE too: **VLFO** runs the track's LFO at a
-  different phase for each voice, so a chord's notes move out of step (ensemble, shimmer), and **DRIFT** gives each
-  voice its own slow random wander, like an analog synth that never quite stays in tune.
+- **Chords that breathe, on any keyboard:** VLFO and DRIFT (above).
 - **A bigger bend range everywhere:** up to ±96 semitones on every MIDI IN setting (Felucca: ±24).
 - **Everything else is Felucca 1.6.1, unchanged.** The same sounds, sequencer, effects and projects.
 
