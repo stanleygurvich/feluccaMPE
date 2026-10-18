@@ -17,6 +17,19 @@ Built on [Felucca](https://github.com/hugelton/Felucca) 1.6.1 by Leo Kuroshita, 
 > flash it, you do so at your own risk: keep the official firmware at hand (M-VAVE's updater, or Felucca's web
 > installer's **Return to official V15**).
 
+## Firmware file
+
+[`prebuilt/felucca-mpe-1.6.1.fwsc`](prebuilt/felucca-mpe-1.6.1.fwsc): the package for the FM-1, built from this repository's
+`main` (commit `e8c7f1a`) with `./build.sh`, JieLi's toolchain and the AC79 SDK files the build checks.
+
+> [!CAUTION]
+> **This file has not been tested on real hardware.** It has never been installed or run on an FM-1. It is a
+> development build with Felucca's package identity (`FM-1_900`), so installers and editors see it as Felucca.
+> Install it only if you can recover the FM-1 (M-VAVE's updater, or Felucca's web installer's **Return to official
+> V15**).
+
+SHA-256: `cb9ca992036fa6f190f78b09f83e5ab138e6e82091d2d347f2789a306fa18bfe`
+
 ## Played with real MPE controllers
 
 Played in the emulator with a **ROLI Seaboard RISE 49** and an **Embodme Erae Touch (Mk 1)**: it works, and it feels
